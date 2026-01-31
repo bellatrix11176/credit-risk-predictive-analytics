@@ -98,10 +98,3 @@ Uncertainty guideline:
 - Lower max confidence indicates borderline predictions (close to 50/50)
 - In a real lending workflow, these cases may require additional review or data
 
----
-
-## Notes About Screenshots
-
-The original assignment requested screenshots from RapidMiner (Design view + Results).  
-This repository recreates the same workflow in Python and produces equivalent outputs, but RapidMiner screenshots should be included in the course submission document if required.
-
