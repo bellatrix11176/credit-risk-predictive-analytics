@@ -1,54 +1,45 @@
 """
-credit_risk_logistic_regression.py
-----------------------------------
-Credit Risk Predictive Analytics (Logistic Regression)
+Credit Risk Logistic Regression — stable fit + RapidMiner-comparable coefficients
+PLUS RapidMiner-style Excel output for scored applicants
 
-GitHub/portable version:
-- Uses repo-relative paths (no hardcoded machine filepath)
-- Reads:  data/CreditRiskData.xlsx  (sheets: "Past Loans", "Loan Applicants")
-- Writes: outputs/
-    - logit_coefficients_pvalues.csv
-    - scored_loan_applicants.csv
-    - scored_loan_applicants.xlsx  (RapidMiner-style table formatting)
+Repo-friendly version:
+- No hard-coded personal filepaths.
+- Reads:  data/CreditRiskData.xlsx
+- Writes: output/...
 
-Modeling notes:
-- Logistic Regression via statsmodels.Logit
-- Handles numeric + categorical predictors
-    - numeric: median imputation
-    - categorical: mode imputation + one-hot encoding
-- Standardizes features for numerical stability, then back-transforms coefficients
-  so "Coefficient_unscaled" is comparable to non-standardized units.
-
-Run:
-    pip install -r requirements.txt
-    python src/credit_risk_logistic_regression.py
+Outputs:
+1) output/scored_loan_applicants.csv
+2) output/logit_coefficients_pvalues.csv
+3) output/scored_loan_applicants.xlsx  (RapidMiner-style formatted)
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-import warnings
-
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 
+# Excel formatting (RapidMiner-like)
 from openpyxl import Workbook
-from openpyxl.styles import Font, Alignment
+from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl.utils import get_column_letter
-from openpyxl.formatting.rule import ColorScaleRule
+from openpyxl.styles import Font, Alignment, PatternFill
+from openpyxl.worksheet.table import Table, TableStyleInfo
+from openpyxl.formatting.rule import FormulaRule
 
 
-# -----------------------------
-# Repo paths (portable)
-# -----------------------------
-REPO_ROOT = Path(__file__).resolve().parents[1]          # repo_root/src/script.py -> repo_root
+# =========================
+# REPO PATHS / SETTINGS
+# =========================
+# This script is in: repo_root/src/credit_risk_logistic_regression.py
+# So repo_root = parent of src/
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
 DATA_DIR = REPO_ROOT / "data"
-OUT_DIR = REPO_ROOT / "outputs"
-OUT_DIR.mkdir(exist_ok=True)
+OUT_DIR = REPO_ROOT / "output"   # matches your folder name: output/
 
-EXCEL_FILE = "CreditRiskData.xlsx"
-FILE_PATH = DATA_DIR / EXCEL_FILE
+EXCEL_FILE = DATA_DIR / "CreditRiskData.xlsx"  # MUST match your file name exactly
 
 SHEET_TRAIN = "Past Loans"
 SHEET_SCORE = "Loan Applicants"
@@ -56,20 +47,11 @@ SHEET_SCORE = "Loan Applicants"
 ID_COL = "Applicant ID"
 LABEL_COL = "Good Risk"
 
-# Flag as "uncertain" if the model's max class probability is below this threshold
-UNCERTAIN_THRESHOLD = 0.70
-
-# If you want the RapidMiner-style column names
-PRED_COL = "prediction(Good Risk)"
-CONF_YES_COL = "confidence(Yes)"
-CONF_NO_COL = "confidence(No)"
+UNCERTAIN_THRESHOLD = 0.70  # max confidence below this = "uncertain"
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
 def normalize_label(series: pd.Series) -> pd.Series:
-    """Convert Yes/No-like labels to 1/0."""
+    """Convert Yes/No labels to 1/0."""
     s = series.astype(str).str.strip().str.lower()
     mapped = s.map({
         "yes": 1, "no": 0,
@@ -82,269 +64,162 @@ def normalize_label(series: pd.Series) -> pd.Series:
     return mapped
 
 
-def split_numeric_categorical(df: pd.DataFrame) -> tuple[list[str], list[str]]:
-    """Return lists of numeric and categorical columns."""
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    categorical_cols = [c for c in df.columns if c not in numeric_cols]
-    return numeric_cols, categorical_cols
+def to_numeric_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Force all columns to numeric; non-numeric becomes NaN."""
+    return df.apply(pd.to_numeric, errors="coerce")
 
 
-def impute_and_encode(
-    train_X: pd.DataFrame,
-    score_X: pd.DataFrame
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Impute missing values and one-hot encode categorical columns
-    in a way that keeps train/score columns aligned.
-    """
-    train = train_X.copy()
-    score = score_X.copy()
-
-    # Force consistent dtypes where possible
-    # (Let pandas infer; we will handle numeric/categorical afterwards.)
-    num_cols_train, cat_cols_train = split_numeric_categorical(train)
-
-    # Numeric: median imputation
-    if num_cols_train:
-        med = train[num_cols_train].median(numeric_only=True)
-        train[num_cols_train] = train[num_cols_train].fillna(med)
-        score[num_cols_train] = score[num_cols_train].fillna(med)
-
-    # Categorical: mode imputation (most frequent)
-    if cat_cols_train:
-        for c in cat_cols_train:
-            mode_val = train[c].mode(dropna=True)
-            fill_val = mode_val.iloc[0] if not mode_val.empty else ""
-            train[c] = train[c].fillna(fill_val).astype(str)
-            score[c] = score[c].fillna(fill_val).astype(str)
-
-        # One-hot encode based on combined categories
-        combined = pd.concat([train[cat_cols_train], score[cat_cols_train]], axis=0)
-        combined_dum = pd.get_dummies(combined, columns=cat_cols_train, drop_first=True)
-
-        train_dum = combined_dum.iloc[:len(train)].reset_index(drop=True)
-        score_dum = combined_dum.iloc[len(train):].reset_index(drop=True)
-
-        # Replace categorical columns with dummies
-        train = pd.concat([train.drop(columns=cat_cols_train).reset_index(drop=True), train_dum], axis=1)
-        score = pd.concat([score.drop(columns=cat_cols_train).reset_index(drop=True), score_dum], axis=1)
-
-    # Ensure numeric
-    train = train.apply(pd.to_numeric, errors="coerce")
-    score = score.apply(pd.to_numeric, errors="coerce")
-
-    # Any remaining NaN (from coercion) -> median
-    med2 = train.median(numeric_only=True)
-    train = train.fillna(med2)
-    score = score.fillna(med2)
-
-    return train, score
+def median_impute(df: pd.DataFrame) -> pd.DataFrame:
+    """Fill NaNs with column medians."""
+    med = df.median(numeric_only=True)
+    return df.fillna(med)
 
 
-def standardize_train(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
-    """
-    Standardize columns using training mean/std:
-        x_scaled = (x - mean) / std
-    Returns scaled df + mean + std.
-    """
+def standardize_train(df: pd.DataFrame):
+    """Standardize columns using training mean/std."""
     mean = df.mean(axis=0)
-    std = df.std(axis=0).replace(0, 1)  # avoid divide-by-zero
+    std = df.std(axis=0).replace(0, 1)
     scaled = (df - mean) / std
     return scaled, mean, std
 
 
 def standardize_apply(df: pd.DataFrame, mean: pd.Series, std: pd.Series) -> pd.DataFrame:
     """Apply training mean/std to standardize scoring data."""
-    # Reindex to be safe
-    df = df.reindex(columns=mean.index, fill_value=0)
     return (df - mean) / std
 
 
-def write_scored_excel(scored_df: pd.DataFrame, out_path: Path) -> None:
-    """
-    Create a RapidMiner-style Excel output:
-    - Row No.
-    - Applicant ID
-    - prediction(Good Risk)
-    - confidence(Yes)
-    - confidence(No)
-    - max_confidence
-    - uncertain_flag
-    With basic formatting + conditional color scale on max_confidence.
-    """
+def save_scored_excel_rapidminer_style(scored_full: pd.DataFrame, out_xlsx: Path):
+    """Save a RapidMiner-like Results table with styling."""
     wb = Workbook()
     ws = wb.active
     ws.title = "Scored Loan Applicants"
 
-    # Build display table with "Row No." first
-    display = scored_df.copy()
-    display.insert(0, "Row No.", range(1, len(display) + 1))
-
-    headers = display.columns.tolist()
-    ws.append(headers)
-
-    # Write rows
-    for row in display.itertuples(index=False, name=None):
-        ws.append(list(row))
+    # Write dataframe
+    for r in dataframe_to_rows(scored_full, index=False, header=True):
+        ws.append(r)
 
     # Header styling
-    header_font = Font(bold=True)
-    for col_idx, h in enumerate(headers, start=1):
-        cell = ws.cell(row=1, column=col_idx)
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center")
+    header_fill = PatternFill("solid", fgColor="D9E1F2")
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.fill = header_fill
 
-    # Freeze header
+    # Freeze and filter
     ws.freeze_panes = "A2"
-
-    # Auto filter
     ws.auto_filter.ref = ws.dimensions
 
-    # Column widths (reasonable defaults)
-    for col_idx, h in enumerate(headers, start=1):
-        col_letter = get_column_letter(col_idx)
-        # Wider for text columns, medium for numeric
-        width = 14
-        if h in ("Row No.",):
-            width = 8
-        elif h == ID_COL:
-            width = 14
-        elif "confidence" in h.lower():
-            width = 16
-        elif "prediction" in h.lower():
-            width = 18
-        elif h in ("uncertain_flag",):
-            width = 14
-        elif h in ("max_confidence",):
-            width = 16
-        ws.column_dimensions[col_letter].width = width
+    # Table styling
+    table = Table(displayName="ScoredApplicants", ref=ws.dimensions)
+    style = TableStyleInfo(
+        name="TableStyleMedium9",
+        showFirstColumn=False,
+        showLastColumn=False,
+        showRowStripes=True,
+        showColumnStripes=False,
+    )
+    table.tableStyleInfo = style
+    ws.add_table(table)
 
-    # Number formats
-    # Confidence columns as percentages with 2 decimals
-    percent_cols = [c for c in headers if "confidence" in c.lower()]
-    percent_cols += ["max_confidence"] if "max_confidence" in headers else []
-    for col_name in percent_cols:
-        col_idx = headers.index(col_name) + 1
-        for r in range(2, ws.max_row + 1):
-            ws.cell(row=r, column=col_idx).number_format = "0.00%"
+    # Column widths (quick auto-fit)
+    for col_idx, col_name in enumerate(scored_full.columns, start=1):
+        max_len = len(str(col_name))
+        for val in scored_full[col_name].head(100).astype(str).values:
+            max_len = max(max_len, len(val))
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(max(10, max_len + 2), 30)
 
-    # Conditional formatting on max_confidence (if present)
-    if "max_confidence" in headers:
-        col_idx = headers.index("max_confidence") + 1
-        col_letter = get_column_letter(col_idx)
-        data_range = f"{col_letter}2:{col_letter}{ws.max_row}"
-        rule = ColorScaleRule(
-            start_type="min", start_color="F8696B",   # red
-            mid_type="percentile", mid_value=50, mid_color="FFEB84",  # yellow
-            end_type="max", end_color="63BE7B"       # green
-        )
-        ws.conditional_formatting.add(data_range, rule)
+    # Conditional formatting for prediction column
+    pred_name = "prediction(Good Risk)"
+    if pred_name in scored_full.columns:
+        pred_col_letter = get_column_letter(scored_full.columns.get_loc(pred_name) + 1)
+        green_fill = PatternFill("solid", fgColor="C6EFCE")
+        red_fill = PatternFill("solid", fgColor="FFC7CE")
 
-    wb.save(out_path)
+        yes_rule = FormulaRule(formula=[f'${pred_col_letter}2="Yes"'], fill=green_fill)
+        no_rule = FormulaRule(formula=[f'${pred_col_letter}2="No"'], fill=red_fill)
+
+        ws.conditional_formatting.add(f"{pred_col_letter}2:{pred_col_letter}{len(scored_full)+1}", yes_rule)
+        ws.conditional_formatting.add(f"{pred_col_letter}2:{pred_col_letter}{len(scored_full)+1}", no_rule)
+
+    # Optional highlight: uncertain_flag True
+    if "uncertain_flag" in scored_full.columns:
+        unc_col_letter = get_column_letter(scored_full.columns.get_loc("uncertain_flag") + 1)
+        yellow_fill = PatternFill("solid", fgColor="FFEB9C")
+        unc_rule = FormulaRule(formula=[f'${unc_col_letter}2=TRUE'], fill=yellow_fill)
+        ws.conditional_formatting.add(f"{unc_col_letter}2:{unc_col_letter}{len(scored_full)+1}", unc_rule)
+
+    wb.save(out_xlsx)
 
 
-# -----------------------------
-# Main workflow
-# -----------------------------
-def main() -> None:
-    if not FILE_PATH.exists():
+def main():
+    # Ensure output directory exists
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    if not EXCEL_FILE.exists():
         raise FileNotFoundError(
-            f"Missing dataset:\n  {FILE_PATH}\n\n"
-            "Fix:\n"
-            f"1) Create a folder named 'data' at your repo root\n"
-            f"2) Put {EXCEL_FILE} inside /data\n"
+            f"Excel file not found:\n{EXCEL_FILE}\n\n"
+            f"Expected repo structure:\n"
+            f"- data/CreditRiskData.xlsx\n"
+            f"- src/credit_risk_logistic_regression.py"
         )
 
-    # Load sheets
-    past = pd.read_excel(FILE_PATH, sheet_name=SHEET_TRAIN)
-    apps = pd.read_excel(FILE_PATH, sheet_name=SHEET_SCORE)
+    # Load data
+    past = pd.read_excel(EXCEL_FILE, sheet_name=SHEET_TRAIN)
+    apps = pd.read_excel(EXCEL_FILE, sheet_name=SHEET_SCORE)
 
     print("Loaded:")
     print(" Past Loans:", past.shape)
     print(" Loan Applicants:", apps.shape)
     print()
 
-    # Prepare y
+    # Training prep
     y = normalize_label(past[LABEL_COL])
     if y.isna().any():
         bad_rows = y[y.isna()].index[:10].tolist()
         raise ValueError(f"Label conversion failed (NaNs) at rows: {bad_rows}")
 
-    # Separate predictors
-    X_train_raw = past.drop(columns=[ID_COL, LABEL_COL])
-    X_score_raw = apps.drop(columns=[ID_COL])
+    X = past.drop(columns=[ID_COL, LABEL_COL])
+    X = median_impute(to_numeric_df(X))
 
-    # Impute + encode categoricals consistently
-    X_train, X_score = impute_and_encode(X_train_raw, X_score_raw)
+    # Standardize for numerical stability (prevents exp overflow)
+    X_scaled, x_mean, x_std = standardize_train(X)
+    Xs_const = sm.add_constant(X_scaled, has_constant="add")
 
-    # Standardize for stability
-    X_train_scaled, x_mean, x_std = standardize_train(X_train)
-    Xs_const = sm.add_constant(X_train_scaled, has_constant="add")
-
-    # Fit model
-    warnings.filterwarnings("ignore", category=RuntimeWarning)
-    warnings.filterwarnings("ignore", category=UserWarning)
-
+    # Fit
     logit = sm.Logit(y, Xs_const)
+    result = logit.fit(disp=False, method="lbfgs", maxiter=2000)
 
-    try:
-        result = logit.fit(disp=False, method="lbfgs", maxiter=5000)
-    except Exception as e:
-        # Common failure mode is perfect separation or quasi-separation
-        raise RuntimeError(
-            "Model fitting failed. This can happen with perfect/quasi separation "
-            "or extreme multicollinearity.\n\n"
-            f"Original error: {e}"
-        ) from e
+    if not result.mle_retvals.get("converged", True):
+        print("⚠️ Model did not fully converge (still usable, but interpret p-values cautiously).")
+    print("✅ Model fit complete.\n")
 
-    converged = bool(getattr(result, "mle_retvals", {}).get("converged", True))
-    if not converged:
-        print("⚠️ Model did not fully converge. Interpret p-values cautiously.\n")
-    else:
-        print("✅ Model fit complete.\n")
-
-    # Back-transform coefficients to original units (RapidMiner-comparable)
+    # Unscale coefficients for RapidMiner comparison
     params = result.params.copy()
     b0_scaled = params["const"]
     b_scaled = params.drop("const")
 
-    # Unscaled coefficients for each feature
     b_unscaled = b_scaled / x_std
-
-    # Unscaled intercept:
-    # logit(p) = b0_scaled + Σ b_scaled * ((x - mean)/std)
-    # => b0_unscaled = b0_scaled - Σ(b_scaled * mean/std)
     b0_unscaled = b0_scaled - np.sum(b_scaled * (x_mean / x_std))
 
-    # Create coefficient table
     table = pd.DataFrame({
         "Attribute": ["Intercept"] + list(b_scaled.index),
         "Coefficient_unscaled": [b0_unscaled] + list(b_unscaled.values),
         "Coefficient_scaled": [b0_scaled] + list(b_scaled.values),
         "Std_Error_scaled": [result.bse["const"]] + list(result.bse.drop("const").values),
         "z_Value_scaled": [result.tvalues["const"]] + list(result.tvalues.drop("const").values),
-        "p_Value": [result.pvalues["const"]] + list(result.pvalues.drop("const").values),
+        "p_Value": [result.pvalues["const"]] + list(result.pvalues.drop("const").values)
     })
 
     out_pvals = OUT_DIR / "logit_coefficients_pvalues.csv"
     table.to_csv(out_pvals, index=False)
 
-    # Print strongest/weakest predictors (exclude intercept)
-    predictors_only = table[table["Attribute"] != "Intercept"].copy()
-    strongest = predictors_only.sort_values("p_Value").head(10)
-    weakest = predictors_only.sort_values("p_Value", ascending=False).head(10)
-
-    print("Top predictors by smallest p-values (strongest):")
-    print(strongest[["Attribute", "Coefficient_unscaled", "p_Value"]].to_string(index=False))
-    print()
-
-    print("Weakest predictors by largest p-values (poorest):")
-    print(weakest[["Attribute", "Coefficient_unscaled", "p_Value"]].to_string(index=False))
-    print()
-
     # Score applicants
-    X_score_scaled = standardize_apply(X_score, x_mean, x_std)
-    Xas_const = sm.add_constant(X_score_scaled, has_constant="add")
+    X_apps = apps.drop(columns=[ID_COL])
+    X_apps = X_apps.reindex(columns=X.columns)
+    X_apps = median_impute(to_numeric_df(X_apps))
+
+    X_apps_scaled = standardize_apply(X_apps, x_mean, x_std)
+    Xas_const = sm.add_constant(X_apps_scaled, has_constant="add")
 
     prob_yes = result.predict(Xas_const).values
     prob_no = 1 - prob_yes
@@ -352,34 +227,32 @@ def main() -> None:
 
     scored = pd.DataFrame({
         ID_COL: apps[ID_COL],
-        PRED_COL: np.where(pred == 1, "Yes", "No"),
-        CONF_YES_COL: prob_yes,
-        CONF_NO_COL: prob_no,
+        "prediction_good_risk": np.where(pred == 1, "Yes", "No"),
+        "confidence_yes": prob_yes,
+        "confidence_no": prob_no
     })
-    scored["max_confidence"] = scored[[CONF_YES_COL, CONF_NO_COL]].max(axis=1)
+    scored["max_confidence"] = scored[["confidence_yes", "confidence_no"]].max(axis=1)
     scored["uncertain_flag"] = scored["max_confidence"] < UNCERTAIN_THRESHOLD
 
-    # Save CSV
     out_scored_csv = OUT_DIR / "scored_loan_applicants.csv"
     scored.to_csv(out_scored_csv, index=False)
 
-    # Save Excel (RapidMiner-style formatting)
+    # Build RapidMiner-like sheet
+    scored_full = apps.copy()
+    scored_full["prediction(Good Risk)"] = scored["prediction_good_risk"]
+    scored_full["confidence(Yes)"] = scored["confidence_yes"].round(3)
+    scored_full["confidence(No)"] = scored["confidence_no"].round(3)
+    scored_full.insert(0, "Row No.", range(1, len(scored_full) + 1))
+    scored_full["max_confidence"] = scored["max_confidence"].round(3)
+    scored_full["uncertain_flag"] = scored["uncertain_flag"]
+
     out_scored_xlsx = OUT_DIR / "scored_loan_applicants.xlsx"
-    write_scored_excel(scored, out_scored_xlsx)
-
-    # Summary print
-    print("Prediction counts (Loan Applicants):")
-    print(scored[PRED_COL].value_counts().to_string())
-    print()
-
-    print("Most uncertain predictions (top 10):")
-    print(scored.sort_values("max_confidence").head(10).to_string(index=False))
-    print()
+    save_scored_excel_rapidminer_style(scored_full, out_scored_xlsx)
 
     print("✅ Saved outputs:")
     print(f"- {out_scored_csv}")
-    print(f"- {out_scored_xlsx}")
     print(f"- {out_pvals}")
+    print(f"- {out_scored_xlsx}")
 
 
 if __name__ == "__main__":
