@@ -21,7 +21,5 @@ This project was originally completed in RapidMiner for a Week 4 team assignment
 
 ---
 
-## Inputs
-
-Place the dataset here:
+🌐 **PixelKraze Analytics (Portfolio):** https://pixelkraze.com/?utm_source=github&utm_medium=readme&utm_campaign=portfolio&utm_content=homepage
 
